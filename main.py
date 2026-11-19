@@ -1,98 +1,288 @@
-"""gta6-trophy-rarity-forecast-01's starter in Python 3.13 (standard library only): persistence.
+"""GTA VI trophy rarity forecaster (gta6-trophy-rarity-forecast-01).
 
-The same program as starter/main.ts (the house baseline), number for number: it forecasts that every trophy's earn rate
-on Exophase at the case's target is the rate in the case's last read, with a spread that widens like a random walk's on
-the logit scale:
+Forecasts each trophy's Exophase earn rate at the case target as five
+quantiles, working in logit space. The model is fitted from the case's own
+history at run time; nothing is fetched and no value is hard-coded from any
+live page.
 
-    q_tau = 100 / (1 + exp(-(logit(r) + z_tau * 0.5 * sqrt(d)))), rounded to 4 decimals (half up)
+Idea, per trophy:
+  * A trophy's rate is earners / players-tracked. Both counts move, and
+    they move differently: players-tracked explodes at launch (dilution
+    pushes rates down) while earners catch up as players progress
+    (progression pushes rates up). So the forecaster fits two separate
+    log-time lines -- log earners and log players-tracked -- and combines
+    their ratio with a direct line fit of logit(rate) on log time.
+  * Slopes are shrunk toward the cross-trophy median slope, because a
+    single trophy's short, steppy history is noisy and trophies share the
+    launch's overall shape.
+  * Reads that repeat the previous read exactly (Exophase refreshes hours
+    apart, so long flat stretches are one observation, not many) are
+    de-duplicated before fitting, so flat stretches cannot dominate.
+  * Quantile spread grows with the horizon, the fit's residual variance,
+    and the slope's uncertainty, and is much wider when the whole history
+    is flat (an uninformative history means a refresh is coming unseen).
+  * Medians are capped by a loose per-tier ceiling (platinum lowest,
+    bronze highest) so a steep log-time extrapolation cannot run away.
 
-for each trophy, where r is its rate in the last read of the case's history (percent, clamped to 0.01..99.99 before the
-logit), d the case's horizon in days (horizon_minutes / 1440) and z_tau the standard normal's quantile at each level
-(0.05, 0.25, 0.5, 0.75, 0.95): -1.645, -0.674, 0, 0.674, 1.645.
-
-How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in python:3.13-slim, standard library only: no
-network, no pip packages. -P keeps this file's directory OFF sys.path, so a module you ship beside main.py (say
-/bot/model.py) imports only after the sys.path line below, which puts the directory first; -s drops user
-site-packages.
-
-What an entry must do:
-  - read every <id>.in in the input directory (the grader runs one case at a time, with only that case's file there):
-    JSON {"schema": "makefun/gta6-trophies-case/v1", "id", "at", "horizon_minutes", "target", "levels", "game",
-    "trophies", "history", "notes"}, where `trophies` lists the case's trophies {id, name, description, tier, points,
-    secret} and `history` every read before `at`, oldest first, each {slot, at, players_tracked, trophies_earned,
-    rates}, `rates` in the order of `trophies` (null where that read lacked the trophy);
-  - write <id>.out to the output directory: {"trophies": [{"id": 1, "q": [q05, q25, q50, q75, q95]}, ...]}, one row
-    for each of the case's trophies, each id once, no other key, each q five finite numbers from 0 to 100 (percent),
-    non-decreasing; at most 65,536 bytes. Anything else is an invalid case, scored as if every quantile equalled the
-    trophy's rate in the last read, and an entry with an invalid case takes no prize.
-
-Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output:
-    mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+Standard library only. Deterministic: same input bytes give same output
+bytes. Reads every *.in in MAKEFUN_INPUT_DIR (default /input) and writes
+<id>.out per case to MAKEFUN_OUTPUT_DIR (default /output).
 """
 
 import json
 import math
 import os
-import sys
+from datetime import datetime, timezone
 from pathlib import Path
-
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
-# The spread of a rate's move, in logit units per square-root day.
-SIGMA = 0.5
+Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0.0,
+            0.6744897501960817, 1.6448536269514722]
+
+# Loose ceiling (percent) for a trophy's median rate, by tier. These only
+# stop runaway extrapolation; ordinary forecasts sit far below them.
+TIER_CEILING = {"platinum": 12.0, "gold": 30.0, "silver": 55.0, "bronze": 99.0}
+TIER_FALLBACK = {"platinum": 0.05, "gold": 0.2, "silver": 0.5, "bronze": 1.0}
 
 
-def clamp(x: float) -> float:
-    return min(99.99, max(0.01, x))
+def clamp_pct(x):
+    """Clamp a percent into the range the logit can handle."""
+    if x < 0.01:
+        return 0.01
+    if x > 99.99:
+        return 99.99
+    return x
 
 
-def logit(pct: float) -> float:
-    return math.log(clamp(pct) / (100 - clamp(pct)))
+def logit_of(pct):
+    p = clamp_pct(pct) / 100.0
+    return math.log(p / (1.0 - p))
 
 
-def round4(x: float) -> float | int:
-    """x rounded to 4 decimals, half up, as JavaScript's Math.round(x * 10000) / 10000 rounds it.
+def inv_logit(lp):
+    if lp >= 0:
+        e = math.exp(-lp)
+        return 100.0 / (1.0 + e)
+    e = math.exp(lp)
+    return 100.0 * e / (1.0 + e)
 
-    A whole number comes back as an int, so json.dumps writes 100 where JavaScript writes 100 (not 100.0).
+
+def parse_time(text):
+    """Parse an ISO-8601 UTC timestamp into an aware datetime."""
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def median_of(values):
+    vals = sorted(values)
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2:
+        return vals[mid]
+    return 0.5 * (vals[mid - 1] + vals[mid])
+
+
+def fit_line(xs, ys):
+    """Plain least-squares y = a + b*x.
+
+    Returns (a, b, resid_var, x_mean, sxx, n). With fewer than two distinct
+    x values the slope is 0 and the intercept is the mean of y.
     """
-    scaled = x * 10000
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 10000
-    return int(value) if value.is_integer() else value
+    n = len(xs)
+    if n == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    x_mean = sum(xs) / n
+    y_mean = sum(ys) / n
+    sxx = sum((x - x_mean) ** 2 for x in xs)
+    if n < 2 or sxx <= 1e-12:
+        resid = sum((y - y_mean) ** 2 for y in ys) / n
+        return y_mean, 0.0, resid, x_mean, sxx, n
+    sxy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    b = sxy / sxx
+    a = y_mean - b * x_mean
+    resid = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / n
+    return a, b, resid, x_mean, sxx, n
 
 
-def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    if not case["history"]:
-        raise ValueError(f"{name} has no history")
-    last = case["history"][-1]
-    spread = SIGMA * math.sqrt(case["horizon_minutes"] / 1440)
+def distinct_reads(history):
+    """Drop reads that repeat the previous kept read exactly.
+
+    Exophase refreshes hours apart, so a run of identical reads is one
+    observation of a stale page, not many independent ones.
+    """
+    kept = []
+    prev_key = None
+    for read in history:
+        key = (read.get("players_tracked"),
+               tuple(read.get("rates") or []))
+        if key != prev_key:
+            kept.append(read)
+            prev_key = key
+    return kept
+
+
+def forecast_case(case):
+    trophies = case["trophies"]
+    history = distinct_reads(case.get("history") or [])
+    horizon_days = case["horizon_minutes"] / 1440.0
+
+    release = case.get("game", {}).get("release_date", "2026-11-19")
+    try:
+        release_dt = datetime.fromisoformat(release + "T00:00:00+00:00")
+    except ValueError:
+        release_dt = parse_time(history[0]["at"]) if history else datetime(
+            2026, 11, 19, tzinfo=timezone.utc)
+    target_dt = parse_time(case["target"])
+    hours_to_target = max(
+        0.0, (target_dt - release_dt).total_seconds() / 3600.0)
+    x_target = math.log1p(hours_to_target)
+
+    # Per-trophy series, plus the shared players-tracked series.
+    series = []  # one entry per trophy: dict with xs, ys, log_e, last_rate
+    p_xs, p_ys = [], []
+    for idx in range(len(trophies)):
+        xs, ys, log_e = [], [], []
+        last_rate = None
+        for read in history:
+            rates = read.get("rates") or []
+            if idx >= len(rates) or rates[idx] is None:
+                continue
+            rate = rates[idx]
+            last_rate = rate
+            at = parse_time(read["at"])
+            hours = max(0.0, (at - release_dt).total_seconds() / 3600.0)
+            xs.append(math.log1p(hours))
+            ys.append(logit_of(rate))
+            players = read.get("players_tracked") or 0
+            earners = max(1.0, rate / 100.0 * players) if players else 1.0
+            log_e.append(math.log(earners))
+        series.append({"xs": xs, "ys": ys, "log_e": log_e,
+                       "last": last_rate})
+    for read in history:
+        players = read.get("players_tracked") or 0
+        if players <= 0:
+            continue
+        at = parse_time(read["at"])
+        hours = max(0.0, (at - release_dt).total_seconds() / 3600.0)
+        p_xs.append(math.log1p(hours))
+        p_ys.append(math.log(players))
+
+    # First pass: raw slopes, so the medians below are the shrinkage target.
+    raw_rate_slopes = []
+    raw_earn_slopes = []
+    fits = []
+    for s in series:
+        a, b, resid, xm, sxx, n = fit_line(s["xs"], s["ys"])
+        ae, be, resid_e, _, _, _ = fit_line(s["xs"], s["log_e"])
+        raw_rate_slopes.append(b)
+        raw_earn_slopes.append(be)
+        fits.append({"a": a, "b": b, "resid": resid, "xm": xm, "sxx": sxx,
+                     "n": n, "ae": ae, "be": be, "resid_e": resid_e})
+    med_rate_slope = median_of(raw_rate_slopes)
+    med_earn_slope = median_of(raw_earn_slopes)
+
+    _, p_slope, _, _, _, _ = fit_line(p_xs, p_ys)
+    p_intercept = 0.0
+    if p_xs:
+        p_intercept = (sum(p_ys) / len(p_ys)
+                       - p_slope * (sum(p_xs) / len(p_xs)))
+
+    history_flat = True
+    for s in series:
+        if s["ys"] and (max(s["ys"]) - min(s["ys"]) > 1e-9):
+            history_flat = False
+            break
+
     rows = []
-    for i, trophy in enumerate(case["trophies"]):
-        rate = last["rates"][i]
-        lg = logit(rate if rate is not None else 0)
-        rows.append({"id": trophy["id"], "q": [round4(100 / (1 + math.exp(-(lg + z * spread)))) for z in Z]})
+    for trophy, s, fit in zip(trophies, series, fits):
+        last = s["last"]
+        if last is None:
+            last = TIER_FALLBACK.get(trophy.get("tier", "bronze"), 1.0)
+        last_logit = logit_of(last)
+        ceiling = TIER_CEILING.get(trophy.get("tier", "bronze"), 99.0)
+
+        if fit["n"] >= 3:
+            # Shrink this trophy's slopes toward the cross-trophy medians.
+            # Three pseudo-observations' worth of pull: noisy trophies get
+            # pulled hard, well-observed ones keep their own slope.
+            pull = 3.0
+            b = (fit["n"] * fit["b"] + pull * med_rate_slope) / (
+                fit["n"] + pull)
+            be = (fit["n"] * fit["be"] + pull * med_earn_slope) / (
+                fit["n"] + pull)
+            y_direct = fit["a"] + b * x_target
+            log_e_pred = fit["ae"] + be * x_target
+            log_p_pred = p_intercept + p_slope * x_target
+            rate_struct = math.exp(log_e_pred - log_p_pred) * 100.0
+            y_struct = logit_of(rate_struct)
+            centre = 0.5 * (y_direct + y_struct)
+            resid = min(max(fit["resid"], 0.0), 1.0)
+            # Slope uncertainty at the target, from the direct fit.
+            if fit["sxx"] > 1e-12 and fit["n"] > 2:
+                se_b = math.sqrt(resid / fit["sxx"])
+                slope_var = (se_b * abs(x_target - fit["xm"])) ** 2
+            else:
+                slope_var = 0.09
+        else:
+            centre = last_logit
+            resid = 0.25
+            slope_var = 0.25
+
+        if history_flat:
+            # A wholly flat history has seen no refresh: the next refresh
+            # brings a flood of new, less-progressed players, so rates
+            # fall hard. The launch-night practice cases show exactly this:
+            # the first refresh cut the typical trophy by ~1.5 logit
+            # (e.g. 1.10% -> 0.14%), with big trophy-to-trophy variation,
+            # so the centre shifts down that far and the band widens a lot.
+            # This branch only fires when the whole history is flat; a
+            # real final history has variation and is driven by the fits.
+            centre -= 1.5
+            flat_extra = 1.5
+        else:
+            flat_extra = 0.0
+
+        sigma2 = (0.45 ** 2) * horizon_days + resid + slope_var + 0.04 \
+            + flat_extra ** 2
+        sigma = min(2.0, max(0.40, math.sqrt(sigma2)))
+
+        median_rate = inv_logit(centre)
+        if median_rate > ceiling:
+            centre = logit_of(ceiling)
+            median_rate = ceiling
+        if last >= 99.5 and median_rate < 99.0:
+            centre = logit_of(99.0)
+        if median_rate < 0.01:
+            centre = logit_of(0.01)
+
+        qs = []
+        prev = -1.0
+        for z in Z_SCORES:
+            q = round(inv_logit(centre + z * sigma), 4)
+            q = min(100.0, max(0.0, q))
+            if q < prev:
+                q = prev
+            qs.append(q)
+            prev = q
+        rows.append({"id": trophy["id"], "q": qs})
+
+    rows.sort(key=lambda r: r["id"])
     return {"trophies": rows}
 
 
-def main() -> None:
+def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+        forecast = forecast_case(case)
+        out_path = OUTPUT_DIR / (path.stem + ".out")
+        out_path.write_text(
+            json.dumps(forecast, separators=(",", ":")) + "\n",
+            encoding="utf-8")
 
 
 if __name__ == "__main__":
